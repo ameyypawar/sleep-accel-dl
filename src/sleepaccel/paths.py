@@ -7,7 +7,7 @@ extracts to a long, versioned directory name
 polysomnography-1.0.0`), and that name could change across dataset
 versions. Hardcoding it would silently break the moment PhysioNet bumps a
 version number. Instead we discover the real dataset root by structure --
-it is, by construction, the directory that has a `labeled_sleep` child --
+it is, by construction, the directory holding both `motion/` and `labels/` --
 which is stable regardless of the outer directory's name.
 
 This module must import cleanly and be fully testable with no dataset
@@ -23,8 +23,16 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DATA_RAW = REPO_ROOT / "data" / "raw"
 
-# Child directory name that marks a directory as the dataset root.
-_MARKER_DIRNAME = "labeled_sleep"
+# Child directories that together mark a directory as the dataset root.
+#
+# Measured from the extracted archive, not guessed: the real layout is
+# motion/, labels/, heart_rate/, steps/. There is no `labeled_sleep`
+# directory -- `_labeled_sleep.txt` is a filename suffix inside `labels/`,
+# which is an easy and silent thing to confuse.
+#
+# Both markers are required rather than either, because `labels` alone is a
+# common enough directory name to match something unrelated.
+_MARKER_DIRNAMES = ("motion", "labels")
 
 
 class DatasetNotFoundError(Exception):
@@ -39,21 +47,27 @@ class DatasetNotFoundError(Exception):
 def _not_found_message(raw_dir: Path) -> str:
     return (
         f"Dataset not found under {raw_dir}. Expected a directory (at "
-        f"any depth up to {3} levels) containing a '{_MARKER_DIRNAME}' "
-        "subdirectory -- this is how the PhysioNet archive is identified, "
-        "since its extracted directory name is long and version-dependent.\n"
+        f"any depth up to 3 levels) containing all of "
+        f"{list(_MARKER_DIRNAMES)} as subdirectories -- this is how the "
+        "PhysioNet archive is identified, since its extracted directory name "
+        "is long and version-dependent.\n"
         "If the archive has been downloaded but not extracted, run:\n"
         f"  unzip {raw_dir}/sleep-accel.zip -d {raw_dir}\n"
         "then re-run this script."
     )
 
 
+def _is_dataset_root(directory: Path) -> bool:
+    """True when `directory` holds every marker subdirectory."""
+    return all((directory / name).is_dir() for name in _MARKER_DIRNAMES)
+
+
 def find_dataset_root(raw_dir: Path, max_depth: int = 3) -> Path:
     """Locate the extracted dataset root under `raw_dir`.
 
     Searches recursively, up to `max_depth` levels below `raw_dir`, for a
-    directory containing a `labeled_sleep` child -- that structural marker
-    is what identifies the true dataset root, independent of the outer
+    directory containing both `motion/` and `labels/` -- that structural
+    marker is what identifies the true dataset root, independent of the outer
     directory's (long, version-dependent) name.
 
     Raises:
@@ -64,7 +78,7 @@ def find_dataset_root(raw_dir: Path, max_depth: int = 3) -> Path:
     if not raw_dir.is_dir() or not any(raw_dir.iterdir()):
         raise DatasetNotFoundError(_not_found_message(raw_dir))
 
-    if (raw_dir / _MARKER_DIRNAME).is_dir():
+    if _is_dataset_root(raw_dir):
         return raw_dir
 
     candidates: list[Path] = []
@@ -77,7 +91,7 @@ def find_dataset_root(raw_dir: Path, max_depth: int = 3) -> Path:
         except (FileNotFoundError, NotADirectoryError, PermissionError):
             return
         for sub in subdirs:
-            if (sub / _MARKER_DIRNAME).is_dir():
+            if _is_dataset_root(sub):
                 candidates.append(sub)
             else:
                 _walk(sub, depth + 1)

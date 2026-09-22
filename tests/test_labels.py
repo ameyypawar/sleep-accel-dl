@@ -17,17 +17,29 @@ from sleepaccel.data.labels import (
 
 
 def test_all_valid_codes_map_into_range():
-    raw = np.array([0, 1, 2, 3, 5])
+    raw = np.array([0, 1, 2, 3, 4, 5])
     class4, valid = map_labels(raw)
     assert valid.all()
-    assert class4.tolist() == [0, 1, 1, 2, 3]
+    assert class4.tolist() == [0, 1, 1, 2, 2, 3]
     assert class4.max() < N_CLASSES
 
 
-def test_stage_four_is_not_a_valid_code():
-    """There is no stage 4 in AASM scoring; it must not silently map."""
-    assert 4 not in RAW_TO_CLASS4
+def test_stage_four_maps_to_deep_despite_the_documentation():
+    """The published description omits stage 4, but 356 epochs contain it.
+
+    It is R&K's deepest slow-wave sleep, merged into N3 by AASM, so it belongs
+    with Deep. Treating it as unknown would discard roughly 10% of the Deep
+    class -- the scarcest of the four.
+    """
+    assert RAW_TO_CLASS4[4] == RAW_TO_CLASS4[3]
     class4, valid = map_labels(np.array([4]))
+    assert valid.all()
+    assert CLASS_NAMES[int(class4[0])] == "Deep"
+
+
+def test_unscored_sentinel_is_invalid():
+    """-1 appears in 438 epochs and is not in the published description."""
+    class4, valid = map_labels(np.array([-1]))
     assert class4.tolist() == [INVALID]
     assert not valid.any()
 
@@ -38,8 +50,8 @@ def test_rem_is_five_not_four():
     assert CLASS_NAMES[int(class4[0])] == "REM"
 
 
-def test_unknown_and_sentinel_codes_are_invalid():
-    class4, valid = map_labels(np.array([-1, 6, 99]))
+def test_unknown_codes_are_invalid():
+    class4, valid = map_labels(np.array([6, 7, 99]))
     assert (class4 == INVALID).all()
     assert not valid.any()
 
@@ -69,7 +81,17 @@ def test_mapping_is_pure_and_does_not_mutate_input():
     assert np.array_equal(raw, before)
 
 
-@pytest.mark.parametrize("code,expected", [(0, "Wake"), (1, "Light"), (2, "Light"), (3, "Deep"), (5, "REM")])
-def test_each_code_maps_to_the_documented_name(code, expected):
+@pytest.mark.parametrize(
+    "code,expected",
+    [(0, "Wake"), (1, "Light"), (2, "Light"), (3, "Deep"), (4, "Deep"), (5, "REM")],
+)
+def test_each_observed_code_maps_to_the_right_class(code, expected):
     class4, _ = map_labels(np.array([code]))
     assert CLASS_NAMES[int(class4[0])] == expected
+
+
+def test_every_code_observed_in_the_real_data_is_handled():
+    """The exact value set counted across all 31 subjects' label files."""
+    observed = np.array([-1, 0, 1, 2, 3, 4, 5])
+    class4, valid = map_labels(observed)
+    assert valid.tolist() == [False, True, True, True, True, True, True]

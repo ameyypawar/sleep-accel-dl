@@ -1,201 +1,174 @@
-"""One-shot probe of the raw sleep-accel dataset's on-disk format.
+"""Measure what is actually in the raw files, and check it against the docs.
 
-Why this exists: before writing a parser, we need ground truth about the
-actual file format -- delimiter, column count, timestamp range, the exact
-set of label values that occur, and the empirical accelerometer sampling
-interval -- rather than assuming the PhysioNet documentation matches the
-delivered files exactly. Run this once, by hand, after the archive is
-extracted and before any parsing code in sleepaccel is written or trusted.
+This script was written before any parser, to settle the on-disk format by
+observation rather than assumption. It earned its place immediately: the
+dataset documentation lists the sleep-stage vocabulary as ``{0,1,2,3,5}``, and
+the files also contain ``4`` (356 epochs) and ``-1`` (438 epochs). Trusting the
+documentation would have silently discarded about 10% of the Deep class.
 
-This script is read-only: it prints results and writes nothing to disk. It
-must fail with DatasetNotFoundError (not a stack trace from deeper in the
-code) when the dataset has not been extracted yet, since that is the
-expected state for most of Phase 0.
+It is kept in the repo, and now reuses :mod:`sleepaccel.data.raw_io`, so it
+doubles as a dataset validation step: run it after extracting the archive and
+it will report anything that has drifted from what the parsers expect.
+
+    python scripts/probe_raw_format.py
+    python scripts/probe_raw_format.py --subjects 5 --json results/probe.json
 """
 
 from __future__ import annotations
 
 import sys
-from collections import Counter
-from pathlib import Path
+from pathlib import Path as _Path
+
+sys.path.insert(0, str(_Path(__file__).resolve().parent.parent / "src"))
+
+import argparse
+import collections
+import json
 
 import numpy as np
 
-# Allow running directly (`.venv/bin/python scripts/probe_raw_format.py`)
-# without requiring PYTHONPATH=src to be set.
-_REPO_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(_REPO_ROOT / "src"))
-
-from sleepaccel.paths import DATA_RAW, SubjectFiles, find_dataset_root  # noqa: E402
-
-# Sibling directory names and per-subject filename suffixes within the
-# dataset root, per the PhysioNet "sleep-accel" layout. `labeled_sleep` is
-# also the structural marker find_dataset_root() looks for.
-_FILE_TYPE_DIRS = {
-    "acceleration": "motion",
-    "heart_rate": "heart_rate",
-    "steps": "steps",
-    "labels": "labeled_sleep",
-}
-_FILE_SUFFIXES = {
-    "acceleration": "_acceleration.txt",
-    "heart_rate": "_heartrate.txt",
-    "steps": "_steps.txt",
-    "labels": "_labeled_sleep.txt",
-}
+from sleepaccel.data.labels import RAW_TO_CLASS4, class_histogram, map_labels
+from sleepaccel.data.raw_io import (
+    discover_subjects,
+    measure_sample_rate,
+    read_acceleration,
+    read_heart_rate,
+    read_labels,
+)
+from sleepaccel.paths import DATA_RAW, find_dataset_root
 
 
-def _detect_delimiter(sample_line: str) -> str:
-    if "," in sample_line:
-        return ","
-    if "\t" in sample_line:
-        return "\\t"
-    return "whitespace"
-
-
-def _split(line: str, delimiter: str) -> list[str]:
-    if delimiter == ",":
-        return [tok.strip() for tok in line.split(",")]
-    if delimiter == "\\t":
-        return [tok.strip() for tok in line.split("\t")]
-    return line.split()
-
-
-def _read_nonempty_lines(path: Path) -> list[str]:
-    with open(path) as f:
-        return [ln.rstrip("\n") for ln in f if ln.strip()]
-
-
-def _probe_file(path: Path, label: str) -> list[str]:
-    """Print probe stats for one file. Returns its non-empty lines."""
-    print(f"  [{label}] {path}")
-    if not path.is_file():
-        print("    MISSING")
-        return []
-    lines = _read_nonempty_lines(path)
-    if not lines:
-        print("    EMPTY FILE")
-        return []
-
-    delim = _detect_delimiter(lines[0])
-    ncols = len(_split(lines[0], delim))
-    print(f"    delimiter={delim!r} columns={ncols} rows={len(lines)}")
-
-    print("    first 5 lines:")
-    for ln in lines[:5]:
-        print(f"      {ln}")
-    print("    last 5 lines:")
-    for ln in lines[-5:]:
-        print(f"      {ln}")
-
-    timestamps: list[float] = []
-    for ln in lines:
-        tok = _split(ln, delim)[0]
-        try:
-            timestamps.append(float(tok))
-        except ValueError:
-            pass
-    if timestamps:
-        print(f"    timestamp range: min={min(timestamps):.3f} max={max(timestamps):.3f}")
-    else:
-        print("    no parseable numeric first column")
-    return lines
+def show_raw_lines(path: _Path, n: int = 3) -> None:
+    """Print the literal first lines, so the delimiter is visible not inferred."""
+    with open(path, "r", encoding="utf-8") as handle:
+        for i, line in enumerate(handle):
+            if i >= n:
+                break
+            print(f"      {line.rstrip()!r}")
 
 
 def main() -> None:
-    dataset_root = find_dataset_root(DATA_RAW)
-    print(f"dataset root: {dataset_root}\n")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--raw-dir", default=str(DATA_RAW))
+    parser.add_argument(
+        "--subjects",
+        type=int,
+        default=0,
+        help="limit how many subjects are fully parsed (0 = all)",
+    )
+    parser.add_argument("--json", default=None, help="write the summary here")
+    args = parser.parse_args()
 
-    type_dirs = {ft: dataset_root / d for ft, d in _FILE_TYPE_DIRS.items()}
-    for ft, d in type_dirs.items():
-        if not d.is_dir():
-            print(f"warning: expected directory for {ft!r} not found: {d}")
+    root = find_dataset_root(_Path(args.raw_dir))
+    subjects = discover_subjects(root)
+    print(f"dataset root : {root}")
+    print(f"subjects     : {len(subjects)} with all four files\n")
 
-    subject_ids_per_type: dict[str, set[str]] = {}
-    for ft, d in type_dirs.items():
-        suffix = _FILE_SUFFIXES[ft]
-        subject_ids_per_type[ft] = (
-            {p.name[: -len(suffix)] for p in d.glob(f"*{suffix}")} if d.is_dir() else set()
+    if not subjects:
+        raise SystemExit("no complete subjects found")
+
+    # --- literal file contents, so delimiters are observed, not assumed ----
+    first = subjects[0]
+    print(f"raw lines for subject {first.subject_id}:")
+    for label, path in (
+        ("motion       (whitespace)", first.acceleration),
+        ("labels       (whitespace)", first.labels),
+        ("heart_rate   (comma)", first.heart_rate),
+        ("steps        (comma)", first.steps),
+    ):
+        print(f"   {label}")
+        show_raw_lines(path)
+
+    # --- label vocabulary across every subject ----------------------------
+    observed: collections.Counter = collections.Counter()
+    epochs_per_subject: list[int] = []
+    for subject in subjects:
+        t_lab, stage = read_labels(subject.labels)
+        observed.update(stage.tolist())
+        epochs_per_subject.append(int(t_lab.size))
+
+        spacing = np.unique(np.diff(t_lab))
+        if spacing.size and not np.allclose(spacing, 30.0):
+            print(f"   WARNING {subject.subject_id}: label spacing {spacing[:5]}")
+
+    print("\nlabel codes observed across all subjects:")
+    for code in sorted(observed):
+        mapped = RAW_TO_CLASS4.get(code)
+        note = "INVALID (excluded)" if mapped is None else f"-> class {mapped}"
+        flag = "  <- not in dataset docs" if code in (-1, 4) else ""
+        print(f"   {code:>3}: {observed[code]:>6} epochs  {note}{flag}")
+
+    all_stage = np.concatenate(
+        [read_labels(s.labels)[1] for s in subjects]
+    )
+    class4, valid = map_labels(all_stage)
+    print("\n4-class distribution:", class_histogram(class4))
+    print(f"usable epochs: {int(valid.sum())} of {valid.size}")
+
+    # --- per-subject signal facts -----------------------------------------
+    limit = args.subjects or len(subjects)
+    print(f"\nper-subject signal summary (first {limit}):")
+    header = f"{'subject':>9} {'epochs':>7} {'accel_n':>9} {'Hz':>6} {'p99_dt':>7} {'hr_n':>6} {'covers':>7}"
+    print(header)
+    print("-" * len(header))
+
+    rates: list[float] = []
+    rows: list[dict] = []
+    for subject in subjects[:limit]:
+        t_lab, _ = read_labels(subject.labels)
+        window = (float(t_lab[0]), float(t_lab[-1]) + 30.0)
+        t_acc, _ = read_acceleration(subject.acceleration, *window)
+        t_hr, _ = read_heart_rate(subject.heart_rate, *window)
+
+        rate = measure_sample_rate(t_acc)
+        rates.append(rate)
+        dt = np.diff(t_acc)
+        p99 = float(np.percentile(dt[dt > 0], 99)) if dt.size else 0.0
+        covers = bool(t_acc.size and t_acc.min() <= window[0] and t_acc.max() >= window[1] - 30)
+
+        print(
+            f"{subject.subject_id:>9} {t_lab.size:>7} {t_acc.size:>9} "
+            f"{rate:>6.1f} {p99:>7.4f} {t_hr.size:>6} {str(covers):>7}"
+        )
+        rows.append(
+            {
+                "subject_id": subject.subject_id,
+                "n_epochs": int(t_lab.size),
+                "n_accel_samples": int(t_acc.size),
+                "sample_rate_hz": rate,
+                "p99_dt": p99,
+                "n_hr_samples": int(t_hr.size),
+                "covers_label_window": covers,
+            }
         )
 
-    all_subject_ids = sorted(set().union(*subject_ids_per_type.values()))
-    print(f"total subjects found: {len(all_subject_ids)}\n")
+    print(
+        f"\nsample rate across subjects: min={min(rates):.1f} Hz "
+        f"max={max(rates):.1f} Hz -- not constant, so resampling onto a fixed "
+        "grid is required rather than optional"
+    )
+    print(
+        f"epochs per subject: min={min(epochs_per_subject)} "
+        f"max={max(epochs_per_subject)} total={sum(epochs_per_subject)}"
+    )
 
-    print("subjects missing one or more of the four files:")
-    any_missing = False
-    for sid in all_subject_ids:
-        missing = [ft for ft, ids in subject_ids_per_type.items() if sid not in ids]
-        if missing:
-            any_missing = True
-            print(f"  {sid}: missing {missing}")
-    if not any_missing:
-        print("  none")
-    print()
-
-    probe_subject_ids = all_subject_ids[:2]
-    accel_timestamp_lists: list[list[float]] = []
-
-    for sid in probe_subject_ids:
-        print(f"=== subject {sid} ===")
-        files = SubjectFiles(
-            subject_id=sid,
-            acceleration=type_dirs["acceleration"] / f"{sid}{_FILE_SUFFIXES['acceleration']}",
-            heart_rate=type_dirs["heart_rate"] / f"{sid}{_FILE_SUFFIXES['heart_rate']}",
-            steps=type_dirs["steps"] / f"{sid}{_FILE_SUFFIXES['steps']}",
-            labels=type_dirs["labels"] / f"{sid}{_FILE_SUFFIXES['labels']}",
+    if args.json:
+        out = _Path(args.json)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(
+            json.dumps(
+                {
+                    "dataset_root": str(root),
+                    "n_subjects": len(subjects),
+                    "label_codes": {str(k): int(v) for k, v in sorted(observed.items())},
+                    "class_distribution": class_histogram(class4),
+                    "subjects": rows,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
         )
-        accel_lines = _probe_file(files.acceleration, "acceleration")
-        _probe_file(files.heart_rate, "heart_rate")
-        _probe_file(files.steps, "steps")
-        _probe_file(files.labels, "labels")
-
-        ts: list[float] = []
-        for ln in accel_lines:
-            delim = _detect_delimiter(ln)
-            tok = _split(ln, delim)[0]
-            try:
-                ts.append(float(tok))
-            except ValueError:
-                pass
-        ts.sort()
-        accel_timestamp_lists.append(ts)
-        print()
-
-    # Distinct label values across ALL subjects, not just the two probed
-    # above -- a rare label value that only appears in subject #30 would
-    # otherwise be missed, and the whole point of this probe is to catch
-    # that before it becomes a silent bug in the label encoder.
-    print("distinct label values across all subjects:")
-    label_values: Counter[str] = Counter()
-    for sid in all_subject_ids:
-        label_path = type_dirs["labels"] / f"{sid}{_FILE_SUFFIXES['labels']}"
-        if not label_path.is_file():
-            continue
-        for ln in _read_nonempty_lines(label_path):
-            delim = _detect_delimiter(ln)
-            tok = _split(ln, delim)[-1]
-            label_values[tok] += 1
-    for value, count in sorted(label_values.items()):
-        print(f"  {value!r}: {count} epochs")
-    print()
-
-    # Empirical accelerometer sampling interval, from the two probed
-    # subjects. Deltas are computed per-subject and only then concatenated,
-    # so the (meaningless) gap between two different subjects' timestamp
-    # references never pollutes the distribution.
-    print("accelerometer sampling interval (from probed subjects):")
-    delta_arrays = [np.diff(np.array(ts)) for ts in accel_timestamp_lists if len(ts) > 1]
-    deltas = np.concatenate(delta_arrays) if delta_arrays else np.array([])
-    deltas = deltas[deltas > 0]
-    if len(deltas) > 0:
-        median = float(np.median(deltas))
-        p1 = float(np.percentile(deltas, 1))
-        p99 = float(np.percentile(deltas, 99))
-        print(f"  median delta-t: {median:.6f} s (implied {1.0 / median:.2f} Hz)")
-        print(f"  1st pct delta-t: {p1:.6f} s (implied {1.0 / p1:.2f} Hz)")
-        print(f"  99th pct delta-t: {p99:.6f} s (implied {1.0 / p99:.2f} Hz)")
-    else:
-        print("  not enough samples to compute delta-t distribution")
+        print(f"\nwrote {out}")
 
 
 if __name__ == "__main__":
