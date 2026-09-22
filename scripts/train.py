@@ -119,7 +119,9 @@ def train_fold(fold, cache, device, args):
         dropout=args.dropout,
     ).to(device)
 
-    weights = make_class_weights(class_counts(list(fold.train_subjects), cache))
+    weights = make_class_weights(
+        class_counts(list(fold.train_subjects), cache), power=args.class_weight_power
+    )
     weight_tensor = torch.tensor(weights, device=device) if weights is not None else None
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
@@ -186,6 +188,12 @@ def main() -> None:
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--hidden-dim", type=int, default=128)
     p.add_argument("--dropout", type=float, default=0.2)
+    p.add_argument(
+        "--class-weight-power",
+        type=float,
+        default=0.5,
+        help="0 = unweighted, 0.5 = sqrt inverse frequency, 1 = full inverse",
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default=None)
     args = p.parse_args()

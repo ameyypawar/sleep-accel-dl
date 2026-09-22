@@ -150,15 +150,26 @@ def masked_cross_entropy(
     )
 
 
-def make_class_weights(counts: np.ndarray, strategy: str = "class_weights") -> np.ndarray | None:
-    """Inverse-frequency weights.
+def make_class_weights(counts: np.ndarray, power: float = 0.5) -> np.ndarray | None:
+    """Inverse-frequency class weights, raised to ``power``.
 
     Light is over half the epochs and Deep under a seventh, so an unweighted
-    loss reaches a decent accuracy by mostly predicting Light -- and a model
-    that never predicts Deep scores near zero kappa on the class that matters.
+    loss (``power=0``) reaches decent accuracy by mostly predicting Light, and
+    a model that never predicts Deep scores near zero kappa on the class that
+    matters most.
+
+    Full inverse frequency (``power=1``) overshoots in the other direction. It
+    was measured here: the model predicted Deep for 9,946 epochs against
+    Light's 6,498, when the truth is 14% Deep and 55% Light, and accuracy fell
+    to 0.346 -- below the 55% you get by always answering Light. Kappa was
+    0.123.
+
+    The square root (``power=0.5``) is the usual compromise: enough of a nudge
+    that the minority classes are learned, not so much that the model inverts
+    the prior.
     """
-    if strategy == "none":
+    if power <= 0:
         return None
     counts = np.asarray(counts, dtype=np.float64)
-    weights = counts.sum() / np.maximum(counts, 1.0)
+    weights = (counts.sum() / np.maximum(counts, 1.0)) ** power
     return (weights / weights.mean()).astype(np.float32)
