@@ -1,0 +1,66 @@
+# Default experiment configuration for sleepaccel.
+#
+# Fields here mirror sleepaccel.config.ExperimentConfig exactly -- load with
+# sleepaccel.config.load_config("configs/default.yaml"). Comments explain
+# choices that are not self-evident from the field name.
+
+# Which sensor streams the model sees. This project's core question is
+# accelerometer-only staging, so this stays "accel_only" for the primary
+# experiments; "accel_hr" and "hr_only" exist for ablation comparisons.
+input_variant: accel_only
+
+# Length of one labeled epoch, in seconds. 30s matches the PSG scoring
+# convention (AASM/R&K) used to generate the ground-truth labels.
+epoch_seconds: 30
+
+# Target accelerometer sampling rate after resampling, in Hz. The raw
+# device sampling rate is irregular (see scripts/probe_raw_format.py);
+# resampling to a fixed grid is required before windowing.
+resample_hz: 30
+
+# Number of consecutive epochs fed to the context model (e.g. 20 epochs x
+# 30s = 10 minutes of context) when scoring the center epoch.
+context_len: 20
+
+# Sequence model applied across the epoch context window.
+#   bilstm       -- bidirectional LSTM over per-epoch embeddings.
+#   transformer  -- transformer encoder over per-epoch embeddings.
+#   none         -- no context model; classify each epoch independently.
+context_model: bilstm
+
+# Step size, in epochs, between consecutive training windows. Smaller than
+# context_len so windows overlap and training sees more examples per night.
+train_stride: 5
+
+# How class imbalance (Wake/Light/Deep/REM are far from balanced) is
+# handled during training.
+#   none              -- no correction.
+#   class_weights     -- inverse-frequency loss weighting.
+#   balanced_sampler  -- oversample minority classes at the batch level.
+imbalance_strategy: class_weights
+
+# Cross-validation scheme.
+#   grouped_5fold -- 5-fold CV grouped by subject (no subject split across folds).
+#   loso          -- leave-one-subject-out.
+cv_scheme: grouped_5fold
+
+seed: 0
+
+# Minimum fraction of an epoch's 30s window that must have accelerometer
+# samples present for the epoch to be kept; epochs with large data gaps
+# are dropped rather than imputed.
+min_epoch_coverage: 0.5
+
+# Largest gap, in seconds, between consecutive raw accelerometer samples
+# that is treated as "still one continuous segment" rather than a break
+# in recording (e.g. device off-wrist).
+max_gap_seconds: 5.0
+
+# Training hyperparameters.
+batch_size: 128
+lr: 0.001
+weight_decay: 0.0001
+max_epochs: 50
+patience: 8
+hidden_dim: 64
+dropout: 0.3
