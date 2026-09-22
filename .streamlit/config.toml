@@ -1,0 +1,9 @@
+# Streamlit's module watcher walks torch.classes.__path__ and raises a
+# RuntimeError on import. Disabling the watcher is the standard fix; the cost
+# is that the app must be restarted manually after editing it.
+[server]
+fileWatcherType = "none"
+headless = true
+
+[theme]
+base = "light"
