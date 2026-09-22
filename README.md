@@ -8,6 +8,14 @@ wrist-wearable staging model of note uses motion *and* heart rate together.
 This project strips heart rate out entirely and asks what motion alone can do,
 then puts it back to measure exactly what it was worth.
 
+**The answer is that it is worth a great deal.** Motion alone reaches
+Cohen's κ = 0.101, well short of the 0.40 clinical threshold; adding heart rate
+takes it to 0.346. And once heart rate is present, motion adds nothing
+statistically detectable on top (Δκ = +0.018, 95% CI [−0.005, +0.042]). The
+hypothesis that a cheap PPG-less band could do four-class staging does not hold
+here — but the breakdown by class is more interesting than the headline, and is
+in [Results](#results).
+
 ```
 30s epoch of triaxial acceleration  [4 x 900]   (x, y, z, magnitude @ 30 Hz)
         |
@@ -40,6 +48,72 @@ classifier do as well?
 RQ2 is the contribution. Either outcome is worth reporting: if heart rate adds
 a lot, that quantifies what cheap bands are losing; if it adds little, cheap
 bands are good enough.
+
+## Results
+
+31 subjects, subject-wise 5-fold cross-validation, identical folds across every
+arm. Pooled over all held-out epochs.
+
+| Variant | κ | macro F1 | Accuracy | Binary κ |
+|---|---|---|---|---|
+| `accel_only` | 0.101 | 0.336 | 0.517 | 0.419 |
+| `accel_only`, no context | 0.078 | 0.281 | 0.568 | 0.361 |
+| `hr_only` | 0.327 | 0.493 | 0.580 | 0.242 |
+| **`accel_hr`** | **0.346** | **0.537** | 0.591 | **0.443** |
+
+Paired bootstrap over subjects, 1,000 resamples:
+
+| Comparison | Δκ | 95% CI | |
+|---|---|---|---|
+| `accel_hr` − `accel_only` | +0.244 | [+0.202, +0.284] | excludes zero |
+| `hr_only` − `accel_only` | +0.226 | [+0.180, +0.271] | excludes zero |
+| `accel_hr` − `hr_only` | +0.018 | [−0.005, +0.042] | **includes zero** |
+| no-context − `accel_only` | −0.023 | [−0.046, −0.000] | excludes zero |
+
+### The hypothesis does not survive
+
+**RQ1: no.** Motion alone reaches κ = 0.101, far below the 0.40 clinical
+threshold. Accelerometer-only 4-class staging is not clinically viable on this
+data. The per-class F1 shows exactly where it fails: Deep 0.090 and REM 0.105.
+Both stages are near-motionless, and without heart rate the model has almost
+nothing to separate them by.
+
+**RQ2: heart rate carries the stage information, and motion adds nothing
+detectable on top of it.** The `accel_hr` − `hr_only` interval contains zero.
+That is the strongest statement this dataset supports, and it contradicts the
+premise that a cheap PPG-less band could do this job.
+
+**RQ3: the sequence model earns its place, narrowly.** Removing it costs
+κ 0.023, an interval that only just excludes zero. The per-class numbers are
+more telling than the aggregate: without context the model predicts Deep and
+REM essentially never (F1 0.000 and 0.001). The BiLSTM is what lets it attempt
+those classes at all.
+
+### The interesting part: the two signals do different jobs
+
+Aggregate κ hides this, and it is the most useful thing here.
+
+| | Wake F1 | Light F1 | Deep F1 | REM F1 | Binary κ |
+|---|---|---|---|---|---|
+| `accel_only` | 0.471 | 0.679 | 0.090 | 0.105 | 0.419 |
+| `hr_only` | 0.291 | 0.664 | 0.487 | 0.531 | 0.242 |
+| `accel_hr` | 0.490 | 0.664 | 0.455 | 0.539 | 0.443 |
+
+**Motion tells you whether someone is awake.** Accelerometer-only reaches
+binary κ 0.419 against heart-rate-only's 0.242 — motion is substantially the
+better sleep/wake signal, which is why classical actigraphy works.
+
+**Heart rate tells you which stage of sleep.** It lifts Deep from 0.090 to
+0.487 and REM from 0.105 to 0.531, where motion is nearly blind.
+
+So the two are complementary along different axes, and combining them gives the
+best binary κ (0.443) and the best macro F1 (0.537). The reason `accel_hr`
+barely beats `hr_only` on overall κ is that four-class κ is dominated by the
+stage distinctions, where motion contributes little — not because motion is
+uninformative in general.
+
+A practical reading: a PPG-less band can tell you *how long* you slept, and
+does it well. It cannot tell you how much of that was deep or REM sleep.
 
 ## Data
 

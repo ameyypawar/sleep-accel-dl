@@ -25,8 +25,16 @@ from sleepaccel.metrics import bootstrap_kappa_delta
 from sleepaccel.paths import REPO_ROOT
 
 PAIRS = [
+    # What heart rate adds to motion. The headline ablation.
     ("accel_only", "accel_hr"),
+    # Heart rate alone against motion alone.
     ("accel_only", "hr_only"),
+    # The crux: does the accelerometer contribute anything ON TOP of heart
+    # rate? If this interval contains zero, motion is redundant once HR is
+    # available, which is the strongest statement this dataset can make about
+    # the original hypothesis.
+    ("hr_only", "accel_hr"),
+    # Does the sequence model earn its place?
     ("accel_only", "accel_only_nocontext"),
 ]
 
