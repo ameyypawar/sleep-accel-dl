@@ -110,7 +110,7 @@ with tabs[0]:
             labels={"x": "", "y": "epochs"},
         )
         fig.update_layout(showlegend=False, height=320)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
         st.subheader("Per-subject signal quality")
         st.caption(
@@ -132,7 +132,7 @@ with tabs[0]:
             for s in manifest["subjects"].values()
         ]
         rows.sort(key=lambda r: r["retained"])
-        st.dataframe(rows, use_container_width=True, hide_index=True)
+        st.dataframe(rows, width="stretch", hide_index=True)
 
 
 # --- RQ1 -------------------------------------------------------------------
@@ -176,7 +176,7 @@ with tabs[1]:
             color_continuous_scale="Blues", text_auto=".2f", zmin=0, zmax=1,
         )
         fig.update_layout(height=420)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
     with right:
         st.subheader("Per-class F1")
         f1 = pooled["per_class_f1"]
@@ -185,7 +185,7 @@ with tabs[1]:
             color_discrete_map=CLASS_COLORS, labels={"x": "", "y": "F1"},
         )
         fig.update_layout(showlegend=False, height=420, yaxis_range=[0, 1])
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     st.subheader("Across folds")
     across = summary["across_folds"]
@@ -205,7 +205,7 @@ with tabs[1]:
             }
             for f in summary["folds"]
         ],
-        use_container_width=True, hide_index=True,
+        width="stretch", hide_index=True,
     )
 
 
@@ -234,7 +234,7 @@ with tabs[2]:
             }
             for k, v in sorted(arms.items())
         ]
-        st.dataframe(rows, use_container_width=True, hide_index=True)
+        st.dataframe(rows, width="stretch", hide_index=True)
 
         fig = px.bar(
             x=[r["variant"] for r in rows], y=[r["kappa"] for r in rows],
@@ -243,7 +243,7 @@ with tabs[2]:
         fig.add_hline(y=0.40, line_dash="dash",
                       annotation_text="clinical threshold 0.40")
         fig.update_layout(height=400, showlegend=False)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
         ablation = RESULTS / "ablation.json"
         if ablation.exists():
@@ -280,11 +280,11 @@ with tabs[3]:
         with c1:
             fig = px.line(records, x="epoch", y="train_loss", color="fold", markers=True)
             fig.update_layout(height=380, title="Training loss")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
         with c2:
             fig = px.line(records, x="epoch", y="val_macro_f1", color="fold", markers=True)
             fig.update_layout(height=380, title="Validation macro F1 (selection metric)")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
         st.caption(
             "Checkpoints are selected on macro F1 rather than accuracy, because "
             "Light is 55% of epochs and accuracy rewards predicting it always."
@@ -323,7 +323,7 @@ with tabs[4]:
             yaxis=dict(tickmode="array", tickvals=list(range(4)), ticktext=list(CLASS_NAMES)),
             legend=dict(orientation="h", y=1.1),
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
         st.subheader("Where it disagrees")
         disagree = (y_true != y_pred).astype(int)
@@ -331,4 +331,4 @@ with tabs[4]:
                                    line=dict(width=1)))
         fig.update_layout(height=180, yaxis=dict(tickvals=[0, 1], ticktext=["agree", "differ"]),
                           xaxis_title="hours")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
