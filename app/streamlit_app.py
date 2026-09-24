@@ -64,10 +64,10 @@ STAGE_TEXT = {
     "Light": "Most of the night (clinically, stages N1 and N2). Easy to wake from, "
              "with occasional small movements.",
     "Deep": "Slow-wave sleep (N3). The hardest stage to wake from, and important for "
-            "physical recovery. The body lies very still and the heart beats slowly "
-            "and steadily.",
+            "physical recovery. The body lies very still and the heartbeat is very steady.",
     "REM": "Dreaming sleep. The brain is highly active but the body is temporarily "
-           "paralysed, so it also lies very still. Heart rate rises and turns irregular.",
+           "paralysed, so it also lies very still. The heartbeat turns irregular, "
+           "speeding up and slowing down from moment to moment.",
 }
 
 #: Hypnograms conventionally draw deeper sleep lower: Wake at the top, then REM,
@@ -81,6 +81,23 @@ ABLATION_LABELS = {
     "accel_hr - hr_only": "Adding motion to heart rate",
     "accel_only_nocontext - accel_only": "Taking away the night context",
 }
+
+WAKE, LIGHT, DEEP, REM = (CLASS_NAMES.index(s) for s in ("Wake", "Light", "Deep", "REM"))
+
+#: Darker versions of the stage colours, for stage names written as text.
+STAGE_INK = {"Wake": "#c62828", "Light": "#1f5f99", "Deep": "#2c3e7a", "REM": "#8e44ad"}
+
+#: Replay controls. A step is how far the night advances per tick, in 30-second chunks.
+REPLAY_SPEEDS = {
+    "Slow: 1 minute per step": 2,
+    "Normal: 5 minutes per step": 10,
+    "Fast: 15 minutes per step": 30,
+}
+TICK_SECONDS = 0.5
+SKIP_CHUNKS = 60      # the -30 min / +30 min buttons
+REPLAY_WINDOW = 60    # the side charts show the last 30 minutes
+#: Vertical nudges so three stage lines that agree don't hide one another.
+REPLAY_OFFSETS = (0.0, 0.14, -0.14)
 
 st.set_page_config(page_title="Sleep staging from a wrist band", layout="wide")
 
@@ -186,6 +203,41 @@ def evaluation_repeats(run_ids: tuple[str, ...]) -> dict | None:
     if not shifts:
         return None
     return {"repeated": repeated, "total": total, "max_kappa_shift": max(shifts)}
+
+
+@st.cache_resource(max_entries=4)
+def replay_signals(subject_id: str) -> dict | None:
+    """The per-chunk signals behind the replay, for one person.
+
+    cache_resource rather than cache_data because the raw motion is tens of
+    megabytes per person, and cache_data would copy it on every tick of the
+    replay. Chunks with no usable motion get NaN rather than 0: drawing 'no
+    data' as 'no movement' is exactly the trap the quality check exists to avoid.
+    """
+    paths = sorted(CACHE.glob(f"*/{subject_id}.npz"))
+    if not paths:
+        return None
+    with np.load(paths[0]) as handle:
+        waveform, keep = handle["waveform"], handle["keep"]
+        feats, hr_ok = handle["hr_feats"], handle["hr_valid"]
+
+    movement = waveform[:, 3, :].std(axis=1).astype(float)
+    movement[~keep] = np.nan
+
+    def hr(column: int) -> np.ndarray:
+        return np.where(hr_ok, feats[:, column], np.nan).astype(float)
+
+    # Take gravity out of each axis, so a still wrist draws flat lines.
+    motion = waveform[:, :3, :] - waveform[:, :3, :].mean(axis=2, keepdims=True)
+    return {
+        "keep": keep,
+        "movement": movement,
+        "motion": motion,
+        "hr_mean": hr(0),
+        "hr_spread": hr(1),
+        "hr_low": hr(2),
+        "hr_high": hr(3),
+    }
 
 
 # --- small helpers ------------------------------------------------------------
@@ -336,26 +388,27 @@ def ablation_chart(ablation: dict) -> tuple[go.Figure, list[str]]:
     return style(fig, 360), keys
 
 
+def stage_to_display(values: np.ndarray) -> np.ndarray:
+    """Map class indices onto hypnogram heights (deepest sleep lowest)."""
+    out = np.full(values.shape, np.nan)
+    for cls, y in DISPLAY_Y.items():
+        out[values == cls] = y
+    return out
+
+
 def hypnogram_chart(timeline: dict, run_id: str) -> go.Figure:
     hours, lab, model = timeline["hours"], timeline["lab"], timeline["model"]
-
-    def to_display(values: np.ndarray) -> np.ndarray:
-        out = np.full(values.shape, np.nan)
-        for cls, y in DISPLAY_Y.items():
-            out[values == cls] = y
-        return out
-
     both = ~np.isnan(lab) & ~np.isnan(model)
     wrong = both & (lab != model)
 
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
                         row_heights=[0.82, 0.18], vertical_spacing=0.05)
     fig.add_trace(go.Scatter(
-        x=hours, y=to_display(lab), name="Sleep lab (the answer)", line_shape="hv",
+        x=hours, y=stage_to_display(lab), name="Sleep lab (the answer)", line_shape="hv",
         connectgaps=False, line=dict(color="#222", width=2),
     ), row=1, col=1)
     fig.add_trace(go.Scatter(
-        x=hours, y=to_display(model), name=f"Model's guess ({name(run_id)})",
+        x=hours, y=stage_to_display(model), name=f"Model's guess ({name(run_id)})",
         line_shape="hv", connectgaps=False,
         line=dict(color=MODEL_COLOR.get(run_id, "#888"), width=2, dash="dot"),
     ), row=1, col=1)
@@ -391,6 +444,317 @@ def training_chart(summary: dict, key: str, title: str, y_title: str, colour: st
     fig.update_layout(title=dict(text=title, font=dict(size=15)),
                       xaxis=dict(title="Training round", dtick=1), yaxis=dict(title=y_title))
     return style(fig, 340), rounds, values
+
+
+# --- the replay simulation ---------------------------------------------------------
+
+
+def stage_html(value: float) -> str:
+    if np.isnan(value):
+        return "<span style='font-size:1.35rem;color:#999'>&mdash;</span>"
+    stage = CLASS_NAMES[int(value)]
+    return (f"<span style='font-size:1.35rem;font-weight:700;"
+            f"color:{STAGE_INK[stage]}'>{stage}</span>")
+
+
+def verdict_html(lab_value: float, guess: float) -> str:
+    if np.isnan(guess):
+        return "<span style='color:#999'>no guess: no usable watch data here</span>"
+    if np.isnan(lab_value):
+        return "<span style='color:#999'>not scored by the lab</span>"
+    if lab_value == guess:
+        return "<span style='color:#2e7d32;font-weight:700'>&#10003; right</span>"
+    return "<span style='color:#c62828;font-weight:700'>&#10007; wrong</span>"
+
+
+def window_range(hours: np.ndarray, i: int) -> list[float]:
+    """A fixed-width 30-minute x-range ending at chunk i, so the side charts scroll
+    smoothly instead of stretching while the window fills up at the start."""
+    chunk = 30 / 3600
+    return [hours[i] - (REPLAY_WINDOW - 1) * chunk, hours[i] + chunk]
+
+
+def replay_night_chart(hours, lab, guesses, pair, i) -> go.Figure:
+    shown = np.arange(lab.size) <= i
+    series = [("Sleep lab (the answer)", lab, dict(color="#222", width=2.5))] + [
+        (name(r), guesses[r],
+         dict(color=MODEL_COLOR.get(r, "#888"), width=2, dash="dot" if k == 0 else "dash"))
+        for k, r in enumerate(pair)
+    ]
+    fig = go.Figure()
+    for (label, values, line), offset in zip(series, REPLAY_OFFSETS):
+        y = stage_to_display(values) + offset
+        y[~shown] = np.nan
+        fig.add_trace(go.Scatter(x=hours, y=y, name=label, line_shape="hv",
+                                 connectgaps=False, line=line, hoverinfo="skip"))
+    fig.add_vline(x=hours[i], line_color="#e45756", line_width=2)
+    fig.update_yaxes(tickvals=DISPLAY_TICKS[0], ticktext=DISPLAY_TICKS[1], range=[-0.5, 3.5])
+    fig.update_xaxes(range=[hours[0], hours[-1] + 30 / 3600],
+                     title="Hours since the recording started")
+    fig.update_layout(legend=dict(orientation="h", y=1.2, x=0))
+    return style(fig, 330)
+
+
+def replay_movement_chart(hours, signals, i, y_max) -> go.Figure:
+    idx = np.arange(max(0, i - REPLAY_WINDOW + 1), i + 1)
+    fig = go.Figure(go.Bar(
+        x=hours[idx], y=signals["movement"][idx] * 1000, width=30 / 3600 * 0.85,
+        marker_color=["#f58518" if k == i else "#8fb8de" for k in idx],
+        hovertemplate="%{y:.1f}<extra></extra>",
+    ))
+    fig.update_layout(
+        title=dict(text="How much the wrist moved", font=dict(size=14)), showlegend=False,
+        xaxis=dict(title="Hours", range=window_range(hours, i)),
+        yaxis=dict(title="Movement", range=[0, y_max]),
+    )
+    return style(fig, 270)
+
+
+def replay_heart_chart(hours, signals, i, y_range) -> go.Figure:
+    idx = np.arange(max(0, i - REPLAY_WINDOW + 1), i + 1)
+    x = hours[idx]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=x, y=signals["hr_high"][idx], mode="lines",
+                             line=dict(width=0), hoverinfo="skip", showlegend=False))
+    fig.add_trace(go.Scatter(x=x, y=signals["hr_low"][idx], mode="lines", line=dict(width=0),
+                             fill="tonexty", fillcolor="rgba(84,162,75,0.25)",
+                             hoverinfo="skip", showlegend=False))
+    fig.add_trace(go.Scatter(x=x, y=signals["hr_mean"][idx], mode="lines+markers",
+                             line=dict(color="#2e7d32", width=2), marker=dict(size=4),
+                             hovertemplate="%{y:.0f} bpm<extra></extra>", showlegend=False))
+    fig.update_layout(
+        title=dict(text="Heart rate", font=dict(size=14)),
+        xaxis=dict(title="Hours", range=window_range(hours, i)),
+        yaxis=dict(title="Beats per minute", range=y_range),
+    )
+    return style(fig, 270)
+
+
+def replay_motion_chart(signals, i, y_limit) -> go.Figure:
+    trace = signals["motion"][i]
+    seconds = np.arange(trace.shape[1]) / 30.0
+    fig = go.Figure()
+    for axis, colour, label in zip(trace, ("#4c78a8", "#f58518", "#54a24b"), ("x", "y", "z")):
+        fig.add_trace(go.Scatter(x=seconds, y=axis, mode="lines", name=label,
+                                 line=dict(color=colour, width=1.3), hoverinfo="skip"))
+    fig.update_layout(
+        title=dict(text="The latest 30 seconds, as the motion sensor recorded them",
+                   font=dict(size=14)),
+        xaxis=dict(title="Seconds", range=[0, 30]),
+        yaxis=dict(title="Acceleration (g)", range=[-y_limit, y_limit]),
+        legend=dict(orientation="h", y=1.25, x=0),
+    )
+    return style(fig, 250)
+
+
+def replay_watch_for(lab, hours, signals, guesses, pair) -> list[str]:
+    """Plain-language pointers for this person's night, computed from their data.
+
+    Each sentence is only emitted if the data backs it for this person: across
+    the 28 people with Wake, Deep and REM all present, the wrist moved more when
+    awake than in Deep sleep for 26, and the heartbeat varied more in REM than in
+    Deep sleep for 27 -- but not for everyone, and the wording says so when not.
+    Three people are missing a stage entirely, which gets a pointer of its own.
+    """
+    def typical(values: np.ndarray, stage: int) -> float | None:
+        sel = (lab == stage) & ~np.isnan(values)
+        return float(np.median(values[sel])) if sel.sum() >= 10 else None
+
+    motion_guess = guesses[pair[0]]
+    move = {s: typical(signals["movement"], s) for s in (WAKE, LIGHT, DEEP, REM)}
+    spread = {s: typical(signals["hr_spread"], s) for s in (DEEP, REM)}
+    when = {s: typical(hours, s) for s in (DEEP, REM)}
+    points: list[str] = []
+
+    # Compare waking against the stillest stage this person actually has.
+    still_stage = DEEP if move[DEEP] else LIGHT if move[LIGHT] else None
+    if move[WAKE] is not None and still_stage is not None:
+        ratio = move[WAKE] / move[still_stage]
+        where = STAGE_PHRASE[CLASS_NAMES[still_stage]]
+        if ratio >= 1.5:
+            text = (f"**Waking up.** When this person was awake, their wrist moved about "
+                    f"{ratio:.1f} times as much as in {where}: watch the movement bars "
+                    "jump when they wake.")
+        elif ratio >= 1.2:
+            text = (f"**Waking up.** When awake, this person's wrist moved only a little "
+                    f"more than in {where} (about {ratio:.1f} times as much).")
+        else:
+            text = (f"**Waking up.** Unusually, this person barely moved more when awake "
+                    f"than in {where}, so waking is hard to spot from motion here.")
+        caught = []
+        for r in pair:
+            scored = (lab == WAKE) & ~np.isnan(guesses[r])
+            if scored.any():
+                caught.append(f"{name(r)} {float((guesses[r][scored] == WAKE).mean()):.0%}")
+        if caught:
+            text += f" Share of their awake time each model spotted: {' and '.join(caught)}."
+        points.append(text)
+
+    for stage in (DEEP, REM):
+        if not (lab == stage).any():
+            stage_name = CLASS_NAMES[stage]
+            alarms = [f"{name(r)} guessed it {int((guesses[r] == stage).sum())} times"
+                      for r in pair]
+            points.append(
+                f"**No {STAGE_PHRASE[stage_name]} tonight.** The sleep lab scored "
+                f"none at all for this person, so every '{stage_name}' guess is a false "
+                f"alarm: {' and '.join(alarms)}."
+            )
+
+    if move[DEEP] and move[REM] is not None:
+        ratio = move[REM] / move[DEEP]
+        if 0.8 <= ratio <= 1.25:
+            text = ("**Deep sleep versus REM.** The movement bars look almost the same in "
+                    "both, so to a motion sensor the two stages are one.")
+        else:
+            text = (f"**Deep sleep versus REM.** For this person the wrist moved "
+                    f"{ratio:.1f} times as much in REM as in Deep sleep.")
+        still = ((lab == DEEP) | (lab == REM)) & ~np.isnan(motion_guess)
+        if still.any():
+            text += (f" The motion-only model answered 'Light' for "
+                     f"{float((motion_guess[still] == LIGHT).mean()):.0%} of this "
+                     "person's Deep and REM chunks.")
+        points.append(text)
+
+    if spread[DEEP] is not None and spread[REM] is not None:
+        if spread[REM] > 1.2 * spread[DEEP]:
+            points.append(
+                f"**What heart rate adds.** Within each 30 seconds, this person's "
+                f"heartbeat varied by about {spread[DEEP]:.1f} bpm in Deep sleep but "
+                f"{spread[REM]:.1f} bpm in REM. Watch the shaded band on the heart-rate "
+                "chart: narrow in Deep sleep, wide in REM. The heart-rate model can see "
+                "that difference; the motion-only model can't."
+            )
+        else:
+            points.append(
+                f"**What heart rate adds.** Unusually, this person's heartbeat was about "
+                f"as variable in Deep sleep ({spread[DEEP]:.1f} bpm) as in REM "
+                f"({spread[REM]:.1f} bpm), so the heart-rate model has less to go on "
+                "than it usually does."
+            )
+
+    if when[DEEP] is not None and when[REM] is not None and when[REM] > when[DEEP]:
+        points.append(
+            f"**Timing.** Deep sleep came mostly early in the night (around "
+            f"{when[DEEP]:.1f} hours in) and REM later (around {when[REM]:.1f} hours "
+            "in): the usual shape of a night's sleep."
+        )
+    return points
+
+
+def reset_replay() -> None:
+    st.session_state.replay_i = 0
+    st.session_state.replay_playing = False
+
+
+def run_replay(pair, hours, lab, guesses, signals, step, scales) -> None:
+    """The player itself.
+
+    It lives in a fragment so each tick redraws only the replay, not the whole
+    dashboard. The fragment's timer (run_every) is fixed when the fragment is
+    defined, so Play and Pause trigger a full rerun to redefine it with the timer
+    on or off; skipping and restarting only need the fragment to redraw.
+    """
+    n = lab.size
+
+    @st.fragment(run_every=TICK_SECONDS if st.session_state.replay_playing else None)
+    def player() -> None:
+        playing = st.session_state.replay_playing
+        controls = st.columns([1.3, 1.2, 1, 1, 3.5])
+        toggle = controls[0].button(
+            "Pause" if playing else "Play", key="replay_toggle", type="primary",
+            icon=":material/pause:" if playing else ":material/play_arrow:", width="stretch")
+        restart = controls[1].button("Restart", key="replay_restart",
+                                     icon=":material/replay:", width="stretch")
+        back = controls[2].button("−30 min", key="replay_back", width="stretch")
+        forward = controls[3].button("+30 min", key="replay_forward", width="stretch")
+
+        i = min(st.session_state.replay_i, n - 1)
+        if toggle:
+            if not playing and i >= n - 1:
+                st.session_state.replay_i = 0  # pressing Play at the end starts over
+            st.session_state.replay_playing = not playing
+            st.rerun()
+        if restart:
+            reset_replay()
+            st.rerun()
+        if back:
+            i = max(0, i - SKIP_CHUNKS)
+        elif forward:
+            i = min(n - 1, i + SKIP_CHUNKS)
+        elif playing:
+            i = min(n - 1, i + step)
+        st.session_state.replay_i = i
+        if playing and i >= n - 1:
+            st.session_state.replay_playing = False
+            st.rerun()
+
+        minutes = int(round((hours[i] - hours[0]) * 60))
+        controls[4].progress((i + 1) / n,
+                             text=f"{minutes // 60}h {minutes % 60:02d}m into the night")
+
+        board = st.columns(3)
+        with board[0], st.container(border=True):
+            st.caption("The sleep lab says")
+            st.markdown(stage_html(lab[i]), unsafe_allow_html=True)
+            st.caption("the answer key")
+        for col, run_id in zip(board[1:], pair):
+            guess = guesses[run_id]
+            scored = ~np.isnan(lab[: i + 1]) & ~np.isnan(guess[: i + 1])
+            right = int((lab[: i + 1][scored] == guess[: i + 1][scored]).sum())
+            total = int(scored.sum())
+            with col, st.container(border=True):
+                st.caption(f"{name(run_id)} guesses")
+                st.markdown(f"{stage_html(guess[i])} &nbsp; {verdict_html(lab[i], guess[i])}",
+                            unsafe_allow_html=True)
+                st.caption(f"Right so far: {right:,} of {total:,} chunks ({right / total:.0%})"
+                           if total else "Right so far: nothing scored yet")
+
+        show(replay_night_chart(hours, lab, guesses, pair, i), key="replay_night")
+        how_to_read(
+            "The night so far, drawn up to the red line. The black line is the sleep lab's "
+            "answer; the two coloured lines are the models' guesses, nudged slightly apart "
+            "so they don't hide each other. Where a guess line has a gap, the watch had no "
+            "usable data there."
+        )
+
+        left, right_side = st.columns(2)
+        with left:
+            show(replay_movement_chart(hours, signals, i, scales["movement"]),
+                 key="replay_movement")
+            how_to_read(
+                "One bar per 30 seconds over the last half hour; the orange bar is now. "
+                "Tall bars mean the wrist moved; flat means it lay still."
+            )
+        with right_side:
+            show(replay_heart_chart(hours, signals, i, scales["heart"]), key="replay_heart")
+            how_to_read(
+                "The line is the average heart rate in each 30 seconds. The shaded band "
+                "shows how far it moved up and down within those 30 seconds: narrow "
+                "means a steady heartbeat, wide means an irregular one."
+            )
+
+        if signals["keep"][i]:
+            show(replay_motion_chart(signals, i, scales["motion"]), key="replay_motion")
+            how_to_read(
+                "The raw data the model reads: one line for each of the three "
+                "directions the sensor measures, with gravity taken out. Flat lines "
+                "mean a still wrist; wiggles mean movement."
+            )
+        else:
+            st.caption("No usable motion data for these 30 seconds, so neither model made a guess here.")
+
+        if i >= n - 1 and not st.session_state.replay_playing:
+            finals = []
+            for run_id in pair:
+                guess = guesses[run_id]
+                scored = ~np.isnan(lab) & ~np.isnan(guess)
+                finals.append(f"**{name(run_id)}** got "
+                              f"{float((lab[scored] == guess[scored]).mean()):.0%} of the night right")
+            st.success("**Night complete.** " + "; ".join(finals) + ". Try another "
+                       "person, or press Play to watch again.", icon=":material/flag:")
+
+    player()
 
 
 # --- page ---------------------------------------------------------------------
@@ -434,20 +798,23 @@ if not runs:
     )
     st.stop()
 
-tabs = st.tabs([
+# Looked up by name, not position, so adding a tab can't silently shift the others.
+TAB_LABELS = [
     "Start here",
     "The data",
     "Can motion alone do it?",
     "What does heart rate add?",
+    "Replay a night",
     "One night, up close",
     "How the model learned",
     "Glossary",
-])
+]
+tab = dict(zip(TAB_LABELS, st.tabs(TAB_LABELS)))
 
 
 # --- 1. Start here -----------------------------------------------------------
 
-with tabs[0]:
+with tab["Start here"]:
     st.header("The project in one minute")
     st.markdown(
         "**The question.** Many cheap fitness bands only have a motion sensor, with "
@@ -525,9 +892,11 @@ with tabs[0]:
     st.markdown(
         "**The key point for this project:** in both Deep sleep and REM sleep the "
         "body lies almost perfectly still, so a motion sensor sees nearly the same "
-        "thing. The heart behaves very differently in the two: slow and steady in "
-        "Deep sleep, faster and irregular in REM. That difference turns out to be "
-        "the whole story."
+        "thing. The heart is what differs: in Deep sleep the heartbeat is steady, "
+        "while in REM it turns irregular. Surprisingly, its *average* speed barely "
+        "changes between the two; it's the steadiness that gives the stage away. "
+        "The heart-rate version of the model can see that difference, and the "
+        "motion-only version can't. The **Replay a night** tab lets you watch it happen."
     )
 
     st.subheader("How it works")
@@ -597,7 +966,7 @@ with tabs[0]:
 
 # --- 2. The data --------------------------------------------------------------
 
-with tabs[1]:
+with tab["The data"]:
     st.header("The data")
     st.markdown(
         "The recordings come from a published study (Walch et al., 2019). **31 adults** "
@@ -707,7 +1076,7 @@ with tabs[1]:
 
 # --- 3. Can motion alone do it? ------------------------------------------------
 
-with tabs[2]:
+with tab["Can motion alone do it?"]:
     st.header("Can motion alone tell the sleep stages apart?")
     st.markdown(
         "This is the main question. Here the model sees **only the wrist motion**, "
@@ -834,7 +1203,7 @@ with tabs[2]:
 
 # --- 4. What does heart rate add? -----------------------------------------------
 
-with tabs[3]:
+with tab["What does heart rate add?"]:
     st.header("What does heart rate add?")
     st.markdown(
         "Same model, same people, same test. The only thing that changes is what the "
@@ -925,8 +1294,8 @@ with tabs[3]:
             f"against {binary[1]:.2f} for heart rate): a moving body is an awake body. "
             f"Heart rate is far better at telling sleep stages apart (Deep and REM F1 "
             f"{deep_rem[1]:.2f}, against {deep_rem[0]:.2f} for motion), because the "
-            "heart behaves differently in Deep sleep and REM even when the body is "
-            "still. Using both gives the best of each."
+            "heartbeat is steady in Deep sleep and irregular in REM, even when the "
+            "body is equally still. Using both gives the best of each."
         )
 
         bottom_line(
@@ -936,9 +1305,70 @@ with tabs[3]:
         )
 
 
-# --- 5. One night, up close ---------------------------------------------------------
+# --- 5. Replay a night (simulation) --------------------------------------------------
 
-with tabs[4]:
+with tab["Replay a night"]:
+    st.header("Replay a night")
+    st.markdown(
+        "Press **Play** to replay one real night, 30 seconds at a time, and watch two "
+        "versions of the model guess the sleep stage side by side: **motion only** and "
+        "**motion + heart rate**. Nothing here is invented or re-run. Every guess is the "
+        "one the model actually made for this person during testing, and neither model "
+        "saw this person during training. The night is simply sped up."
+    )
+
+    pair = [r for r in ("accel_only", "accel_hr")
+            if r in runs and load_predictions(r) is not None]
+    if len(pair) < 2:
+        st.info("The replay needs both the 'Motion only' and 'Motion + heart rate' results.")
+    else:
+        subjects = load_predictions(pair[0])["subjects"]
+        people = sorted(np.unique(subjects).tolist(), key=int)
+        busiest = max(people, key=lambda p: int((subjects == p).sum()))
+        c1, c2 = st.columns(2)
+        subject_id = c1.selectbox(
+            "Person", people, index=people.index(busiest),
+            format_func=lambda p: f"Person {p}", key="replay_person", on_change=reset_replay,
+        )
+        speed = c2.selectbox("Speed", list(REPLAY_SPEEDS), index=1, key="replay_speed")
+
+        timelines = {r: night_timeline(r, subject_id, runs[r]["args"]["context_len"]) for r in pair}
+        signals = replay_signals(subject_id)
+        if signals is None or any(t is None for t in timelines.values()):
+            st.warning(
+                "Couldn't line this person's data up for the replay, so it isn't shown "
+                "rather than being drawn in the wrong place."
+            )
+        else:
+            if "replay_i" not in st.session_state:
+                reset_replay()
+            lab, hours = timelines[pair[0]]["lab"], timelines[pair[0]]["hours"]
+            guesses = {r: timelines[r]["model"] for r in pair}
+
+            points = replay_watch_for(lab, hours, signals, guesses, pair)
+            if points:
+                st.info("**What to watch for in this night**\n\n"
+                        + "\n".join(f"- {point}" for point in points),
+                        icon=":material/visibility:")
+
+            # Fixed per-person scales: if the axes rescaled every tick, half a minute of
+            # near-stillness would be stretched to look like vigorous movement.
+            movement = signals["movement"][~np.isnan(signals["movement"])]
+            low, high = signals["hr_low"], signals["hr_high"]
+            scales = {
+                "movement": max(1.0, float(np.percentile(movement, 99)) * 1000 * 1.15)
+                            if movement.size else 1.0,
+                "heart": [float(np.nanpercentile(low, 1)) - 3, float(np.nanpercentile(high, 99)) + 3]
+                         if np.isfinite(low).any() else [40, 100],
+                "motion": max(0.01, 4 * float(np.percentile(movement, 99)))
+                          if movement.size else 0.05,
+            }
+            run_replay(pair, hours, lab, guesses, signals, REPLAY_SPEEDS[speed], scales)
+
+
+# --- 6. One night, up close ---------------------------------------------------------
+
+with tab["One night, up close"]:
     st.header("One night, up close")
     st.markdown(
         "A **hypnogram** is a map of one night's sleep: time runs from left to right, "
@@ -1037,9 +1467,9 @@ with tabs[4]:
                 )
 
 
-# --- 6. How the model learned -------------------------------------------------
+# --- 7. How the model learned -------------------------------------------------
 
-with tabs[5]:
+with tab["How the model learned"]:
     st.header("How the model learned")
     st.markdown(
         "The model learns in **training rounds**. In each round it works through all "
@@ -1107,9 +1537,9 @@ with tabs[5]:
         )
 
 
-# --- 7. Glossary ------------------------------------------------------------------
+# --- 8. Glossary ------------------------------------------------------------------
 
-with tabs[6]:
+with tab["Glossary"]:
     st.header("Glossary")
     st.markdown("Every technical term used in this dashboard, in plain English.")
 
@@ -1138,6 +1568,10 @@ with tabs[6]:
         "- **Heart-rate sensor (PPG):** the green light on the back of many watches, "
         "which reads your pulse from blood flow under the skin. Cheaper bands often "
         "don't have one.\n"
+        "- **Heart-rate variability:** how much the heartbeat speeds up and slows "
+        "down from moment to moment, measured here as the spread of heart-rate "
+        "readings within each 30 seconds. In this data it separates Deep sleep from "
+        "REM far better than average heart rate does.\n"
         "- **Sampling rate:** how many readings a sensor takes per second. Here it "
         "varied from about 10 to 67 per second between watches, so every recording "
         "was converted to a common 30.\n"
