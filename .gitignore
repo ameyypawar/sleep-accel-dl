@@ -1,6 +1,11 @@
-data/
-results/
-.venv/
+# Anchored with a leading slash on purpose. An unanchored `data/` matches every
+# directory named data at any depth -- including the source package
+# src/sleepaccel/data/ -- and silently kept the whole data pipeline out of the
+# repository for its first dozen commits.
+/data/
+/results/
+/.venv/
+
 __pycache__/
 *.pyc
 .pytest_cache/
